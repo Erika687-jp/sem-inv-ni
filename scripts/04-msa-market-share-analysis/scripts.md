@@ -29,10 +29,6 @@ sns.set_palette("husl")
 ## 4.2. Cargar archivos fuente (Trademap)
 
 ```
-#@title 4.2. Cargar archivos fuente (Trademap) { display-mode: "form" }
-#@markdown Marque la casilla solo si desea elegir las columnas manualmente (por ejemplo, si la detección automática falla).
-asignacion_manual = False  #@param {type:"boolean"}
-
 import os
 import re
 import unicodedata
@@ -392,15 +388,14 @@ for year in sorted(df['year'].unique()):
         print(f"  {i}. {row['partner_country']}: {row['market_share']:.1f}% ({row['trade_value_usd']/1000:.0f}M USD)")
 ```
 
-## 4.5. Generar Gráficos analíticos
+## 4.5. Generar Gráficos analíticos con selector de paleta de colores
 
 ```
-#@title 4.5. Generar Gráficos analíticos (con selector de paleta de colores)
 import re
 import matplotlib.colors as mcolors
 
 # ---------------------------------------------------------------------------
-# 1. PALETAS PREDETERMINADAS (definición centralizada de colores)
+# 1. PALETAS PREDETERMINADAS (definición centralizada de colores
 #    'series': un color por país, en orden fijo (país 1 = color 1, etc.).
 #    'tinta' : color neutro para textos, etiquetas y línea de referencia.
 # ---------------------------------------------------------------------------
