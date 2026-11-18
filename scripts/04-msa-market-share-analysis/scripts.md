@@ -27,300 +27,295 @@ sns.set_palette("husl")
 ```
 
 ## 4.2. Cargar archivos fuente (Trademap)
-# ============================================================
-# 4.2. CARGAR ARCHIVOS FUENTE (TRADEMAP) CON DETECCIÓN FLEXIBLE
-# ============================================================
-# Funciona con archivos de Trade Map en español o inglés (.xls / .xlsx).
-# Si la detección automática no es concluyente, el script pide
-# seleccionar las columnas escribiendo su número (índice).
-# Para elegir siempre las columnas a mano, cambie a: MODO_MANUAL = True
-
-!pip install -q xlrd   # lector de archivos .xls antiguos
+```
+# Soporte para archivos .xls (además de .xlsx)
+!pip install -q openpyxl xlrd
 
 import re
-import io
+import unicodedata
 
-MODO_MANUAL = False
+# ============================================================
+# CONFIGURACIÓN OPCIONAL: ASIGNACIÓN MANUAL DE COLUMNAS
+# Dejar en None para usar la detección automática.
+# Se pueden indicar nombres o índices (posiciones) de columna.
+#   Ejemplos:
+#   COLUMNA_PAIS_MANUAL   = 'Exportadores'      o  0
+#   COLUMNAS_VALOR_MANUAL = ['Valor importado en 2020', 'Valor importado en 2021']
+#                           o  [1, 2, 3, 4, 5]   o  '1-5'
+# ============================================================
+COLUMNA_PAIS_MANUAL = None
+COLUMNAS_VALOR_MANUAL = None
 
-# ---------- 1. Vocabulario para reconocer cabeceras (español / inglés) ----------
-PALABRAS_PAIS = ['exportador', 'importador', 'exporter', 'importer', 'socio', 'partner',
-                 'pais', 'country', 'countries', 'mercado', 'market', 'proveedor', 'supplier',
-                 'origen', 'origin', 'destino', 'destination', 'reporter', 'region']
-PALABRAS_VALOR = ['valor', 'value', 'importad', 'exportad', 'imported', 'exported',
-                  'comercio', 'trade', 'usd', 'dolar', 'dollar']
-PALABRAS_EXCLUIR = ['cantidad', 'quantity', 'unidad', 'unit', 'crecimiento', 'growth',
-                    'participacion', 'share', 'tasa', 'rate', 'balanza', 'balance',
-                    'precio', 'price', '%', 'ranking', 'distancia', 'distance', 'arancel', 'tariff']
-FILAS_TOTAL = {'mundo', 'world', 'total', 'total mundial', 'world total'}
-PATRON_ANIO = re.compile(r'(?<!\d)(19[5-9]\d|20\d{2})(?!\d)')
+# Palabras clave reconocidas (español e inglés)
+KEYWORDS_PAIS = ['exportador', 'importador', 'exporter', 'importer', 'socio', 'partner',
+                 'pais', 'country', 'countries', 'mercado', 'market', 'proveedor',
+                 'supplier', 'origen', 'origin', 'destino', 'destination']
+KEYWORDS_VALOR = ['valor', 'value', 'importad', 'exportad', 'imported', 'exported',
+                  'import', 'export', 'comercio', 'trade', 'usd', 'dolar', 'dollar']
+KEYWORDS_EXCLUIR = ['cantidad', 'quantity', 'unidad', 'unit', 'tasa', 'rate', 'growth',
+                    'crecimiento', 'participacion', 'share', '%', 'distancia', 'distance',
+                    'balanza', 'balance', 'arancel', 'tariff', 'concentracion', 'concentration']
+FILAS_TOTALES = ['mundo', 'world', 'total', 'total general', 'grand total']
 
 
+# ---------- Funciones auxiliares ----------
 def normalizar(texto):
-    """Minúsculas y sin tildes, para comparar cabeceras sin depender de la escritura exacta."""
-    t = str(texto).lower().strip()
-    for a, b in zip('áéíóúüñ', 'aeiouun'):
-        t = t.replace(a, b)
-    return re.sub(r'\s+', ' ', t)
+    """Minúsculas, sin tildes y sin espacios extra."""
+    texto = unicodedata.normalize('NFKD', str(texto))
+    texto = ''.join(c for c in texto if not unicodedata.combining(c))
+    return ' '.join(texto.lower().split())
 
+def extraer_anio(texto):
+    """Devuelve el año (1950-2100) contenido en una cabecera, o None."""
+    anios = [int(a) for a in re.findall(r'(?<!\d)(\d{4})(?!\d)', str(texto)) if 1950 <= int(a) <= 2100]
+    return anios[-1] if anios else None
 
-def anio_de(cabecera):
-    m = PATRON_ANIO.search(str(cabecera))
-    return int(m.group(1)) if m else None
-
+def a_numero(serie):
+    """Convierte a número valores como '1,234' o ' 567 '."""
+    if pd.api.types.is_numeric_dtype(serie):
+        return serie
+    limpia = (serie.astype(str)
+                   .str.replace('\xa0', '', regex=False)
+                   .str.replace(' ', '', regex=False)
+                   .str.replace(',', '', regex=False))
+    return pd.to_numeric(limpia, errors='coerce')
 
 def proporcion_numerica(serie):
-    s = serie.dropna()
-    if len(s) == 0:
-        return 0.0
-    return pd.to_numeric(limpiar_numeros(s), errors='coerce').notna().mean()
+    datos = serie.dropna()
+    return a_numero(datos).notna().mean() if len(datos) else 0.0
 
-
-def limpiar_numeros(serie):
-    """Quita espacios y separadores de miles (Trade Map exporta enteros en miles USD)."""
-    if not pd.api.types.is_numeric_dtype(serie):
-        serie = (serie.astype(str).str.replace(' ', '', regex=False)
-                 .str.replace(' ', '', regex=False).str.replace(',', '', regex=False))
-    return serie
-
-
-# ---------- 2. Lectura del archivo (.xls, .xlsx o .xls que en realidad es texto/HTML) ----------
-def leer_trademap(nombre, contenido=None):
-    """Lee el archivo sin asumir cabeceras y luego ubica la fila de encabezado."""
-    fuente = io.BytesIO(contenido) if contenido is not None else nombre
-    crudo, errores = None, []
-    lectores = [
-        ('Excel', lambda f: pd.read_excel(f, sheet_name=0, header=None)),
-        ('texto tabulado', lambda f: pd.read_csv(f, sep='\t', header=None, encoding='latin-1', dtype=str)),
-        ('HTML', lambda f: pd.read_html(f, header=None)[0]),
-    ]
-    for nombre_lector, lector in lectores:
+def leer_archivo_sin_cabecera(nombre):
+    """Lee .xlsx/.xls. Algunos .xls de Trade Map son en realidad tablas HTML o texto."""
+    def leer_html():
+        tabla = pd.read_html(nombre, encoding='utf-8')[0]
+        cab = [' '.join(str(x) for x in c if 'Unnamed' not in str(x)) if isinstance(c, tuple) else c
+               for c in tabla.columns]
+        return pd.DataFrame([cab] + tabla.values.tolist())   # conservar la cabecera como fila
+    errores = []
+    for lector in (lambda: pd.read_excel(nombre, sheet_name=0, header=None),
+                   leer_html,
+                   lambda: pd.read_csv(nombre, sep='\t', header=None, encoding='utf-8'),
+                   lambda: pd.read_csv(nombre, sep='\t', header=None, encoding='latin-1')):
         try:
-            if hasattr(fuente, 'seek'):
-                fuente.seek(0)
-            crudo = lector(fuente)
-            if crudo is not None and crudo.shape[1] >= 2:
-                break
-            crudo = None
+            tabla = lector()
+            if tabla.shape[1] > 1:
+                return tabla
         except Exception as e:
-            errores.append(f'{nombre_lector}: {e}')
-    if crudo is None:
-        raise ValueError('❌ No fue posible leer el archivo. Verifique que sea un .xls o .xlsx '
-                         'descargado de Trade Map.\nDetalle: ' + ' | '.join(errores))
+            errores.append(str(e))
+    raise ValueError("❌ No fue posible leer el archivo. Verifica que sea un Excel (.xlsx o .xls) "
+                     f"exportado desde Trade Map.\nDetalles: {errores}")
 
-    # Ubicar la fila de encabezado: la primera (de las 20 iniciales) con 2 o más años
-    fila_cab = 0
-    for i in range(min(20, len(crudo))):
-        if sum(anio_de(v) is not None for v in crudo.iloc[i].tolist()) >= 2:
-            fila_cab = i
-            break
-    cabeceras, vistos = [], {}
-    for j, v in enumerate(crudo.iloc[fila_cab].tolist()):
-        nombre_col = str(v).strip() if pd.notna(v) and str(v).strip() else f'Columna_{j}'
-        if nombre_col in vistos:                      # evitar nombres repetidos
-            vistos[nombre_col] += 1
-            nombre_col = f'{nombre_col} ({vistos[nombre_col]})'
+def detectar_fila_cabecera(tabla, max_filas=25):
+    """Busca la fila con más cabeceras de años y palabras clave de país."""
+    mejor_fila, mejor_puntaje = 0, -1
+    for i in range(min(max_filas, len(tabla))):
+        celdas = [normalizar(v) for v in tabla.iloc[i].values if pd.notna(v)]
+        n_anios = sum(1 for c in celdas if extraer_anio(c))
+        n_pais = sum(1 for c in celdas if any(k in c for k in KEYWORDS_PAIS))
+        puntaje = n_anios * 2 + n_pais
+        if n_anios >= 1 and puntaje > mejor_puntaje:
+            mejor_fila, mejor_puntaje = i, puntaje
+    return mejor_fila
+
+def mostrar_columnas(df_cols):
+    """Interfaz de selección: muestra índice, nombre, ejemplo y % numérico."""
+    print("\n📋 COLUMNAS DISPONIBLES EN EL ARCHIVO")
+    print("-" * 80)
+    print(f"{'Índice':<7} {'Nombre de la columna':<45} {'Ejemplo':<15} {'% numérico':>10}")
+    print("-" * 80)
+    for i, col in enumerate(df_cols.columns):
+        no_nulos = df_cols[col].dropna()
+        ejemplo = str(no_nulos.iloc[0])[:14] if len(no_nulos) else '(vacía)'
+        print(f"{i:<7} {str(col)[:44]:<45} {ejemplo:<15} {proporcion_numerica(df_cols[col]):>9.0%}")
+    print("-" * 80)
+
+def resolver_columnas(entrada, columnas):
+    """Convierte nombres, índices o rangos ('1-5', '1,2,3') en nombres de columnas."""
+    if entrada is None:
+        return []
+    if isinstance(entrada, (int, str)):
+        entrada = [entrada]
+    elementos = []
+    for e in entrada:
+        if isinstance(e, str) and e.strip() not in columnas:
+            for parte in e.split(','):
+                parte = parte.strip()
+                if re.fullmatch(r'\d+\s*-\s*\d+', parte):
+                    ini, fin = [int(x) for x in parte.split('-')]
+                    elementos.extend(range(ini, fin + 1))
+                elif parte.isdigit():
+                    elementos.append(int(parte))
+                elif parte:
+                    elementos.append(parte)
         else:
-            vistos[nombre_col] = 0
-        cabeceras.append(nombre_col)
-    datos = crudo.iloc[fila_cab + 1:].reset_index(drop=True)
-    datos.columns = cabeceras
-    datos = datos.dropna(how='all').reset_index(drop=True)
-    return datos
+            elementos.append(e.strip() if isinstance(e, str) else e)
+    resultado = []
+    for e in elementos:
+        if isinstance(e, int):
+            if not 0 <= e < len(columnas):
+                raise ValueError(f"❌ El índice {e} no existe. Índices válidos: 0 a {len(columnas)-1}.")
+            resultado.append(columnas[e])
+        elif e in columnas:
+            resultado.append(e)
+        else:
+            raise ValueError(f"❌ La columna '{e}' no existe en el archivo.")
+    return list(dict.fromkeys(resultado))
 
+def detectar_columna_pais(tabla, excluidas):
+    """Devuelve (columna, es_concluyente)."""
+    candidatas = [c for c in tabla.columns if c not in excluidas]
+    por_nombre = [c for c in candidatas if any(k in normalizar(c) for k in KEYWORDS_PAIS)
+                  and proporcion_numerica(tabla[c]) < 0.5]
+    if len(por_nombre) == 1:
+        return por_nombre[0], True
+    if len(por_nombre) > 1:
+        return por_nombre[0], False
+    # Por características: columnas mayoritariamente de texto
+    texto = [c for c in candidatas if tabla[c].notna().mean() > 0.5 and proporcion_numerica(tabla[c]) < 0.2]
+    if len(texto) == 1:
+        return texto[0], True
+    return (texto[0] if texto else None), False
 
-# ---------- 3. Detección automática ----------
-def detectar_columna_pais(datos):
-    """Puntúa cada columna por su cabecera y por su contenido (texto, valores distintos)."""
-    puntajes = {}
-    for col in datos.columns:
-        if anio_de(col) is not None:
-            continue
-        cab = normalizar(col)
-        serie = datos[col].dropna()
-        if len(serie) == 0:
-            continue
-        texto = 1 - proporcion_numerica(serie)
-        unicos = serie.astype(str).nunique() / len(serie)
-        puntaje = texto + unicos
-        if any(p in cab for p in PALABRAS_PAIS):
-            puntaje += 2
-        if 'codigo' in cab or 'code' in cab:
-            puntaje -= 2
-        puntajes[col] = puntaje
-    if not puntajes:
-        return None, 'no se encontró ninguna columna de texto con nombres de países'
-    orden = sorted(puntajes.items(), key=lambda x: x[1], reverse=True)
-    mejor, p1 = orden[0]
-    if p1 < 2.5:
-        return None, f'la mejor candidata ("{mejor}") no tiene una cabecera reconocible de país/socio'
-    if len(orden) > 1 and orden[1][1] >= p1 - 0.25:
-        return None, f'hay varias candidatas para la columna de países: "{mejor}" y "{orden[1][0]}"'
-    return mejor, None
+def detectar_columnas_valor(tabla):
+    """Devuelve (lista de columnas, es_concluyente)."""
+    con_anio = [c for c in tabla.columns if extraer_anio(c)
+                and not any(k in normalizar(c) for k in KEYWORDS_EXCLUIR)
+                and proporcion_numerica(tabla[c]) >= 0.5]
+    con_clave = [c for c in con_anio if any(k in normalizar(c) for k in KEYWORDS_VALOR)]
+    elegidas = con_clave if con_clave else con_anio
+    anios = [extraer_anio(c) for c in elegidas]
+    concluyente = len(elegidas) > 0 and len(anios) == len(set(anios))
+    return elegidas, concluyente
 
-
-def detectar_columnas_valor(datos):
-    """Columnas con año en la cabecera y contenido numérico, excluyendo cantidades, tasas, etc."""
-    con_anio = [c for c in datos.columns if anio_de(c) is not None
-                and not any(p in normalizar(c) for p in PALABRAS_EXCLUIR)
-                and proporcion_numerica(datos[c]) >= 0.5]
-    if not con_anio:
-        return None, 'no se encontraron columnas con años en la cabecera y valores numéricos'
-    con_palabra = [c for c in con_anio if any(p in normalizar(c) for p in PALABRAS_VALOR)]
-    candidatas = con_palabra if con_palabra else con_anio
-    anios = [anio_de(c) for c in candidatas]
+def validar_columnas(tabla, col_pais, cols_valor):
+    """Verifica que las columnas sean compatibles con el procesamiento."""
+    problemas = []
+    if col_pais is None:
+        problemas.append("No se identificó la columna de países.")
+    elif proporcion_numerica(tabla[col_pais]) > 0.5:
+        problemas.append(f"La columna de países '{col_pais}' contiene principalmente números.")
+    if not cols_valor:
+        problemas.append("No se identificaron columnas de valores comerciales.")
+    if col_pais in cols_valor:
+        problemas.append("La columna de países no puede ser también una columna de valores.")
+    sin_anio = [c for c in cols_valor if extraer_anio(c) is None]
+    if sin_anio:
+        problemas.append(f"Estas columnas no indican un año en su cabecera: {sin_anio}")
+    anios = [extraer_anio(c) for c in cols_valor if extraer_anio(c)]
     repetidos = sorted({a for a in anios if anios.count(a) > 1})
     if repetidos:
-        return None, (f'hay más de una columna para el/los año(s) {repetidos} '
-                      '(por ejemplo, valores importados y exportados en el mismo archivo)')
-    return candidatas, None
-
-
-# ---------- 4. Validación de correspondencias ----------
-def validar_columnas(datos, col_pais, cols_valor, anios):
-    problemas = []
-    if col_pais in cols_valor:
-        problemas.append('la columna de países no puede ser también una columna de valores')
-    if proporcion_numerica(datos[col_pais]) > 0.5:
-        problemas.append(f'"{col_pais}" parece contener números, no nombres de países')
-    for c, a in zip(cols_valor, anios):
-        if a is None:
-            problemas.append(f'no se identificó el año de la columna "{c}"')
-        if proporcion_numerica(datos[c]) < 0.5:
-            problemas.append(f'"{c}" no contiene valores numéricos suficientes')
-    if len(set(anios)) != len(anios):
-        problemas.append('hay años repetidos entre las columnas de valores seleccionadas')
+        problemas.append(f"Hay años repetidos en las columnas de valores: {repetidos}")
+    no_numericas = [c for c in cols_valor if c != col_pais and proporcion_numerica(tabla[c]) < 0.5]
+    if no_numericas:
+        problemas.append(f"Estas columnas no contienen valores numéricos: {no_numericas}")
     return problemas
 
-
-# ---------- 5. Asignación manual (por número de columna) ----------
-def interpretar_indices(texto, total):
-    """Admite '3', '2,3,4' o rangos '2-6'."""
-    indices = []
-    for parte in str(texto).replace(' ', '').split(','):
-        if not parte:
-            continue
-        if '-' in parte:
-            a, b = parte.split('-', 1)
-            indices.extend(range(int(a), int(b) + 1))
-        else:
-            indices.append(int(parte))
-    if not indices or any(i < 0 or i >= total for i in indices):
-        raise ValueError(f'use números entre 0 y {total - 1}')
-    return list(dict.fromkeys(indices))
-
-
-def seleccion_manual(datos, entrada=input, intentos=3):
-    columnas = list(datos.columns)
-    print('\n📋 COLUMNAS DISPONIBLES EN EL ARCHIVO')
-    print('=' * 60)
-    for i, c in enumerate(columnas):
-        ejemplo = datos[c].dropna().astype(str).head(2).tolist()
-        print(f'  [{i}] {c}   → ej.: {", ".join(ejemplo)}')
-    for intento in range(1, intentos + 1):
-        try:
-            i_pais = interpretar_indices(entrada('\n👉 Número de la columna de PAÍSES / socios: '), len(columnas))
-            if len(i_pais) != 1:
-                raise ValueError('seleccione una sola columna de países')
-            i_val = interpretar_indices(entrada('👉 Números de las columnas de VALORES por año '
-                                                '(ej.: 2,3,4 o 2-6): '), len(columnas))
-            col_pais = columnas[i_pais[0]]
-            cols_valor = [columnas[i] for i in i_val]
-            previos = validar_columnas(datos, col_pais, cols_valor, list(range(len(cols_valor))))
-            if previos:
-                raise ValueError('; '.join(previos))
-            anios = [anio_de(c) for c in cols_valor]
-            if any(a is None for a in anios):
-                faltan = [c for c, a in zip(cols_valor, anios) if a is None]
-                txt = entrada(f'👉 No se identificó el año en {faltan}. Escriba los años en el '
-                              f'mismo orden (ej.: 2022,2023): ')
-                try:
-                    nuevos = [int(x) for x in txt.replace(' ', '').split(',') if x]
-                except ValueError:
-                    raise ValueError('escriba los años como números separados por comas, ej.: 2022,2023')
-                if len(nuevos) != len(faltan):
-                    raise ValueError(f'se esperaban {len(faltan)} año(s)')
-                it = iter(nuevos)
-                anios = [a if a is not None else next(it) for a in anios]
-            problemas = validar_columnas(datos, col_pais, cols_valor, anios)
-            if problemas:
-                raise ValueError('; '.join(problemas))
-            return col_pais, cols_valor, anios
-        except ValueError as e:
-            msg = str(e)
-            if 'invalid literal' in msg:
-                msg = 'escriba solo números de columna, ej.: 3 o 2,3,4 o 2-6'
-            print(f'⚠️ Selección no válida ({intento}/{intentos}): {msg}')
-    raise ValueError('❌ No se completó una selección válida de columnas. Vuelva a ejecutar la celda.')
+def seleccion_manual(tabla, col_pais_sugerida, cols_valor_sugeridas):
+    """Pide al usuario elegir las columnas por nombre o índice."""
+    mostrar_columnas(tabla)
+    columnas = list(tabla.columns)
+    print("\n✍️  ASIGNACIÓN MANUAL (Enter = aceptar la sugerencia)")
+    try:
+        sug_p = columnas.index(col_pais_sugerida) if col_pais_sugerida in columnas else ''
+        r = input(f"Índice o nombre de la columna de PAÍSES [{sug_p}]: ").strip()
+        col_pais = resolver_columnas(r, columnas)[0] if r else col_pais_sugerida
+        sug_v = ','.join(str(columnas.index(c)) for c in cols_valor_sugeridas)
+        r = input(f"Índices o nombres de las columnas de VALORES por año (ej. 1-5 o 1,2,3) [{sug_v}]: ").strip()
+        cols_valor = resolver_columnas(r, columnas) if r else cols_valor_sugeridas
+    except EOFError:
+        raise ValueError("❌ No se pudo pedir la selección manual. Asigna las columnas en "
+                         "COLUMNA_PAIS_MANUAL y COLUMNAS_VALOR_MANUAL y vuelve a ejecutar.")
+    return col_pais, cols_valor
 
 
-# ---------- 6. Proceso completo: detección → (manual) → melt → limpieza ----------
-def procesar_trademap(datos, modo_manual=False, entrada=input):
-    col_pais = cols_valor = anios = None
-    if not modo_manual:
-        col_pais, motivo_pais = detectar_columna_pais(datos)
-        cols_valor, motivo_valor = detectar_columnas_valor(datos)
-        if col_pais and cols_valor:
-            anios = [anio_de(c) for c in cols_valor]
-            problemas = validar_columnas(datos, col_pais, cols_valor, anios)
-            if problemas:
-                print('⚠️ La detección automática encontró inconsistencias: ' + '; '.join(problemas))
-                col_pais = None
-            else:
-                print('✅ Detección automática exitosa')
-        else:
-            print('⚠️ La detección automática no fue concluyente:')
-            for m in (motivo_pais, motivo_valor):
-                if m:
-                    print(f'   - {m}')
-    if modo_manual or not (col_pais and cols_valor):
-        col_pais, cols_valor, anios = seleccion_manual(datos, entrada)
-        print('✅ Selección manual registrada')
-
-    print(f'   Columna de países: "{col_pais}"')
-    print('   Columnas de valores por año:')
-    for c, a in zip(cols_valor, anios):
-        print(f'     {a} ← "{c}"')
-
-    # Transformar de formato ancho a formato largo (melt)
-    df_melted = datos.melt(id_vars=[col_pais], value_vars=cols_valor,
-                           var_name='year_column', value_name='trade_value_usd')
-    df_melted['year'] = df_melted['year_column'].map(dict(zip(cols_valor, anios))).astype(int)
-    df_melted = df_melted.rename(columns={col_pais: 'partner_country'})
-
-    # Limpiar datos
-    df_melted['partner_country'] = df_melted['partner_country'].astype(str).str.strip()
-    df_melted['trade_value_usd'] = pd.to_numeric(limpiar_numeros(df_melted['trade_value_usd']), errors='coerce')
-    df = df_melted[['year', 'partner_country', 'trade_value_usd']].copy()
-
-    # Eliminar filas con datos faltantes y fila "Mundo" / "World"
-    df = df.dropna(subset=['trade_value_usd'])
-    df = df[~df['partner_country'].map(normalizar).isin(FILAS_TOTAL)].reset_index(drop=True)
-    if df.empty:
-        raise ValueError('❌ Después de la limpieza no quedaron datos. Revise las columnas seleccionadas.')
-    return df, df_melted, cols_valor
-
-
-# ---------- 7. Ejecución ----------
+# ---------- 1. Cargar archivo ----------
 # Subir archivo Excel directamente desde TradeMap
 uploaded = files.upload()
 filename = list(uploaded.keys())[0]
 
-# Leer datos tal como vienen de TradeMap
-df_raw = leer_trademap(filename, uploaded[filename])
+tabla_completa = leer_archivo_sin_cabecera(filename)
+fila_cabecera = detectar_fila_cabecera(tabla_completa)
+
+# Leer datos tal como vienen de TradeMap, usando la fila de cabecera detectada
+df_raw = tabla_completa.iloc[fila_cabecera + 1:].copy()
+cabeceras = [str(c).strip() if pd.notna(c) else f'Columna_{i}'
+             for i, c in enumerate(tabla_completa.iloc[fila_cabecera].values)]
+vistos = {}
+for i, c in enumerate(cabeceras):          # evitar nombres de columna repetidos
+    if c in vistos:
+        vistos[c] += 1
+        cabeceras[i] = f"{c}.{vistos[c]}"
+    else:
+        vistos[c] = 0
+df_raw.columns = cabeceras
+df_raw = df_raw.dropna(how='all').dropna(axis=1, how='all').reset_index(drop=True)
 
 # Verificar estructura original
+print(f"Fila de cabecera detectada: {fila_cabecera + 1}")
 print("Columnas disponibles:", df_raw.columns.tolist())
 print("\nPrimeras 5 filas:")
 print(df_raw.head())
-print()
 
-df, df_melted, year_columns = procesar_trademap(df_raw, modo_manual=MODO_MANUAL)
+# ---------- 2. Identificar columnas ----------
+columnas = list(df_raw.columns)
+if COLUMNA_PAIS_MANUAL is not None or COLUMNAS_VALOR_MANUAL is not None:
+    print("\n🔧 Usando asignación manual definida en la configuración.")
+    auto_valor, _ = detectar_columnas_valor(df_raw)
+    year_columns = resolver_columnas(COLUMNAS_VALOR_MANUAL, columnas) or auto_valor
+    auto_pais, _ = detectar_columna_pais(df_raw, year_columns)
+    country_col = resolver_columnas(COLUMNA_PAIS_MANUAL, columnas)[0] if COLUMNA_PAIS_MANUAL is not None else auto_pais
+else:
+    year_columns, valor_ok = detectar_columnas_valor(df_raw)
+    country_col, pais_ok = detectar_columna_pais(df_raw, year_columns)
+    if valor_ok and pais_ok:
+        print("\n✅ Detección automática concluyente.")
+    else:
+        print("\n⚠️  La detección automática no fue concluyente.")
+        country_col, year_columns = seleccion_manual(df_raw, country_col, year_columns)
+
+# ---------- 3. Validar correspondencias ----------
+problemas = validar_columnas(df_raw, country_col, year_columns)
+if problemas:
+    mostrar_columnas(df_raw)
+    raise ValueError("❌ Inconsistencias encontradas:\n  - " + "\n  - ".join(problemas) +
+                     "\nAjusta COLUMNA_PAIS_MANUAL / COLUMNAS_VALOR_MANUAL y vuelve a ejecutar.")
+
+print(f"Columna de países: '{country_col}'")
+print(f"Columnas de años encontradas: {year_columns}")
+print("Correspondencia año → columna:")
+for col in year_columns:
+    print(f"  {extraer_anio(col)} → {col}")
+
+# ---------- 4. Transformar de formato ancho a formato largo (melt) ----------
+df_melted = df_raw.melt(
+    id_vars=[country_col],
+    value_vars=year_columns,
+    var_name='year_column',
+    value_name='trade_value_usd'
+)
+
+# Extraer año de la columna
+df_melted['year'] = df_melted['year_column'].apply(extraer_anio).astype(int)
+df_melted = df_melted.rename(columns={country_col: 'partner_country'})
+
+# Limpiar datos
+df_melted['partner_country'] = df_melted['partner_country'].astype(str).str.strip()
+df_melted['trade_value_usd'] = a_numero(df_melted['trade_value_usd'])
+df = df_melted[['year', 'partner_country', 'trade_value_usd']].copy()
+
+# Eliminar filas con datos faltantes y fila "Mundo" / "World"
+df = df.dropna(subset=['trade_value_usd'])
+df = df[~df['partner_country'].apply(normalizar).isin(FILAS_TOTALES + ['nan', ''])].reset_index(drop=True)
+
+if df.empty:
+    raise ValueError("❌ Después de la limpieza no quedaron datos. Revisa las columnas seleccionadas.")
 
 print(f"\nDatos procesados: {len(df)} filas")
 print(f"Países únicos: {df['partner_country'].nunique()}")
 print(f"Años disponibles: {sorted(df['year'].unique())}")
 print("\nPrimeros datos procesados:")
 print(df.head(10))
+```
 
 ## 4.3. Calcular Market Share, Ranking y aplicar filtros
 
@@ -378,7 +373,7 @@ for year in sorted(df['year'].unique()):
 ```
 
 ## 4.5. Generar Gráficos analíticos con selector de paleta de colores
-
+```
 # ============================================================
 # 4.5. GRÁFICOS ANALÍTICOS CON SELECCIÓN DE PALETA DE COLORES
 # ============================================================
@@ -591,7 +586,7 @@ display(widgets.VBox([
     widgets.HTML('<h3 style="margin:0">🎨 Seleccione la paleta de colores para los gráficos</h3>'),
     vista_previa, selector_paleta, campo_css, boton, mensaje, salida,
 ]))
-
+```
 ## 4.6. Generar Insights estratégicos o "Descubrimientos relevantes" 
 
 **Nota:** *Reemplazar "producto analizado" (Line 2) y "Producto" (Line 35) por el número de partida y nombre del producto analizado antes de proceder con la ejecución del script.*
